@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+outputs/
+metrics/
+.DS_Store
+*.parquet
