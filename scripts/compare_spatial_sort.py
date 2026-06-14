@@ -26,7 +26,8 @@ DEFAULT_QUERIES = (
     ("sf_bay", -122.65, 37.55, -121.75, 38.05),
     ("new_york", -74.30, 40.45, -73.65, 40.95),
     ("london", -0.55, 51.25, 0.35, 51.75),
-    ("world_1deg", -0.50, -0.50, 0.50, 0.50),
+    ("paris", 2.20, 48.75, 2.45, 48.95),
+    ("singapore", 103.60, 1.20, 104.05, 1.50),
 )
 
 
@@ -63,6 +64,12 @@ class QueryMetrics:
     query: str
     bbox: tuple[float, float, float, float]
     rows: int
+    candidate_row_groups: int
+    total_row_groups: int
+    candidate_row_group_fraction: float
+    candidate_rows: int
+    total_rows: int
+    candidate_row_fraction: float
     repeats: int
     warmups: int
     best_seconds: float
@@ -70,7 +77,6 @@ class QueryMetrics:
     median_seconds: float
     p25_seconds: float
     p75_seconds: float
-    p95_seconds: float
     stdev_seconds: float
     all_seconds: list[float]
 
@@ -91,13 +97,29 @@ def load_extension(con: duckdb.DuckDBPyConnection, name: str) -> None:
         con.execute(f"LOAD {name}")
 
 
-def connect(threads: int | None, memory_limit: str | None) -> duckdb.DuckDBPyConnection:
+def disable_duckdb_caches(con: duckdb.DuckDBPyConnection) -> None:
+    con.execute("SET enable_external_file_cache = false")
+    con.execute("SET enable_http_metadata_cache = false")
+    con.execute("SET parquet_metadata_cache = false")
+    con.execute("SET enable_caching_operators = false")
+
+
+def connect(
+    threads: int | None,
+    memory_limit: str | None,
+    *,
+    disable_cache: bool = False,
+    load_spatial: bool = True,
+) -> duckdb.DuckDBPyConnection:
     con = duckdb.connect()
     if threads is not None:
         con.execute(f"SET threads = {int(threads)}")
     if memory_limit:
         con.execute(f"SET memory_limit = '{memory_limit}'")
-    load_extension(con, "spatial")
+    if disable_cache:
+        disable_duckdb_caches(con)
+    if load_spatial:
+        load_extension(con, "spatial")
     return con
 
 
@@ -370,12 +392,71 @@ def bbox_query_sql(path: str, bbox: tuple[float, float, float, float]) -> str:
     """
 
 
+def row_group_candidates(
+    con: duckdb.DuckDBPyConnection,
+    path: str,
+    bbox: tuple[float, float, float, float],
+) -> tuple[int, int, int, int]:
+    xmin, ymin, xmax, ymax = bbox
+    candidate_row_groups, total_row_groups, candidate_rows, total_rows = con.execute(
+        f"""
+        WITH row_groups AS (
+            SELECT
+                row_group_id,
+                max(row_group_num_rows) AS rows,
+                min(CASE
+                    WHEN path_in_schema = 'bbox, xmin'
+                    THEN try_cast(stats_min_value AS DOUBLE)
+                END) AS xmin,
+                min(CASE
+                    WHEN path_in_schema = 'bbox, ymin'
+                    THEN try_cast(stats_min_value AS DOUBLE)
+                END) AS ymin,
+                max(CASE
+                    WHEN path_in_schema = 'bbox, xmax'
+                    THEN try_cast(stats_max_value AS DOUBLE)
+                END) AS xmax,
+                max(CASE
+                    WHEN path_in_schema = 'bbox, ymax'
+                    THEN try_cast(stats_max_value AS DOUBLE)
+                END) AS ymax
+            FROM parquet_metadata({sql_literal_path(path)})
+            WHERE path_in_schema IN ('bbox, xmin', 'bbox, ymin', 'bbox, xmax', 'bbox, ymax')
+            GROUP BY row_group_id
+        ),
+        candidates AS (
+            SELECT *
+            FROM row_groups
+            WHERE xmax >= {xmin}
+              AND xmin <= {xmax}
+              AND ymax >= {ymin}
+              AND ymin <= {ymax}
+        )
+        SELECT
+            (SELECT count(*) FROM candidates),
+            (SELECT count(*) FROM row_groups),
+            coalesce((SELECT sum(rows) FROM candidates), 0),
+            coalesce((SELECT sum(rows) FROM row_groups), 0)
+        """
+    ).fetchone()
+    return (
+        int(candidate_row_groups),
+        int(total_row_groups),
+        int(candidate_rows),
+        int(total_rows),
+    )
+
+
 def query_metrics(
     algorithm: str,
     source: str,
     query_name: str,
     bbox: tuple[float, float, float, float],
     rows: int,
+    candidate_row_groups: int,
+    total_row_groups: int,
+    candidate_rows: int,
+    total_rows: int,
     repeats: int,
     warmups: int,
     times: list[float],
@@ -386,6 +467,16 @@ def query_metrics(
         query=query_name,
         bbox=bbox,
         rows=rows,
+        candidate_row_groups=candidate_row_groups,
+        total_row_groups=total_row_groups,
+        candidate_row_group_fraction=(
+            candidate_row_groups / total_row_groups
+            if total_row_groups
+            else 0.0
+        ),
+        candidate_rows=candidate_rows,
+        total_rows=total_rows,
+        candidate_row_fraction=candidate_rows / total_rows if total_rows else 0.0,
         repeats=repeats,
         warmups=warmups,
         best_seconds=min(times),
@@ -393,10 +484,35 @@ def query_metrics(
         median_seconds=statistics.median(times),
         p25_seconds=percentile(times, 0.25),
         p75_seconds=percentile(times, 0.75),
-        p95_seconds=percentile(times, 0.95),
         stdev_seconds=statistics.stdev(times) if len(times) > 1 else 0.0,
         all_seconds=times,
     )
+
+
+def execute_count_query(
+    con: duckdb.DuckDBPyConnection,
+    sql: str,
+    *,
+    fresh_connection: bool,
+    threads: int | None,
+    memory_limit: str | None,
+    needs_httpfs: bool,
+) -> int:
+    if not fresh_connection:
+        return int(con.execute(sql).fetchone()[0])
+
+    query_con = connect(
+        threads,
+        memory_limit,
+        disable_cache=True,
+        load_spatial=False,
+    )
+    if needs_httpfs:
+        load_extension(query_con, "httpfs")
+    try:
+        return int(query_con.execute(sql).fetchone()[0])
+    finally:
+        query_con.close()
 
 
 def benchmark_queries_interleaved(
@@ -407,6 +523,9 @@ def benchmark_queries_interleaved(
     repeats: int,
     warmups: int,
     seed: int,
+    fresh_connection_per_query: bool,
+    threads: int | None,
+    memory_limit: str | None,
 ) -> list[QueryMetrics]:
     results: list[QueryMetrics] = []
     rng = random.Random(seed)
@@ -416,6 +535,10 @@ def benchmark_queries_interleaved(
         bbox = (xmin, ymin, xmax, ymax)
         sql_by_algorithm = {
             algorithm: bbox_query_sql(path, bbox)
+            for algorithm, path in outputs.items()
+        }
+        row_group_counts = {
+            algorithm: row_group_candidates(con, path, bbox)
             for algorithm, path in outputs.items()
         }
         rows_by_algorithm: dict[str, int] = {}
@@ -428,17 +551,38 @@ def benchmark_queries_interleaved(
             order = algorithms[:]
             rng.shuffle(order)
             for algorithm in order:
-                rows_by_algorithm[algorithm] = int(
-                    con.execute(sql_by_algorithm[algorithm]).fetchone()[0]
+                rows_by_algorithm[algorithm] = execute_count_query(
+                    con,
+                    sql_by_algorithm[algorithm],
+                    fresh_connection=fresh_connection_per_query,
+                    threads=threads,
+                    memory_limit=memory_limit,
+                    needs_httpfs=source == "remote",
                 )
 
         for repeat_index in range(repeats):
             order = algorithms[:]
             rng.shuffle(order)
             for algorithm in order:
-                start = time.perf_counter_ns()
-                rows = int(con.execute(sql_by_algorithm[algorithm]).fetchone()[0])
-                elapsed = (time.perf_counter_ns() - start) / 1_000_000_000
+                if fresh_connection_per_query:
+                    query_con = connect(
+                        threads,
+                        memory_limit,
+                        disable_cache=True,
+                        load_spatial=False,
+                    )
+                    if source == "remote":
+                        load_extension(query_con, "httpfs")
+                    try:
+                        start = time.perf_counter_ns()
+                        rows = int(query_con.execute(sql_by_algorithm[algorithm]).fetchone()[0])
+                        elapsed = (time.perf_counter_ns() - start) / 1_000_000_000
+                    finally:
+                        query_con.close()
+                else:
+                    start = time.perf_counter_ns()
+                    rows = int(con.execute(sql_by_algorithm[algorithm]).fetchone()[0])
+                    elapsed = (time.perf_counter_ns() - start) / 1_000_000_000
                 rows_by_algorithm[algorithm] = rows
                 times_by_algorithm[algorithm].append(elapsed)
 
@@ -450,6 +594,10 @@ def benchmark_queries_interleaved(
                     name,
                     bbox,
                     rows_by_algorithm[algorithm],
+                    row_group_counts[algorithm][0],
+                    row_group_counts[algorithm][1],
+                    row_group_counts[algorithm][2],
+                    row_group_counts[algorithm][3],
                     repeats,
                     warmups,
                     times_by_algorithm[algorithm],
@@ -542,6 +690,12 @@ def write_query_csv(path: Path, results: list[QueryMetrics]) -> None:
                 "xmax": result.bbox[2],
                 "ymax": result.bbox[3],
                 "rows": result.rows,
+                "candidate_row_groups": result.candidate_row_groups,
+                "total_row_groups": result.total_row_groups,
+                "candidate_row_group_fraction": result.candidate_row_group_fraction,
+                "candidate_rows": result.candidate_rows,
+                "total_rows": result.total_rows,
+                "candidate_row_fraction": result.candidate_row_fraction,
                 "repeats": result.repeats,
                 "warmups": result.warmups,
                 "best_seconds": result.best_seconds,
@@ -549,7 +703,6 @@ def write_query_csv(path: Path, results: list[QueryMetrics]) -> None:
                 "median_seconds": result.median_seconds,
                 "p25_seconds": result.p25_seconds,
                 "p75_seconds": result.p75_seconds,
-                "p95_seconds": result.p95_seconds,
                 "stdev_seconds": result.stdev_seconds,
             }
             for result in results
@@ -563,6 +716,12 @@ def write_query_csv(path: Path, results: list[QueryMetrics]) -> None:
             "xmax",
             "ymax",
             "rows",
+            "candidate_row_groups",
+            "total_row_groups",
+            "candidate_row_group_fraction",
+            "candidate_rows",
+            "total_rows",
+            "candidate_row_fraction",
             "repeats",
             "warmups",
             "best_seconds",
@@ -570,7 +729,6 @@ def write_query_csv(path: Path, results: list[QueryMetrics]) -> None:
             "median_seconds",
             "p25_seconds",
             "p75_seconds",
-            "p95_seconds",
             "stdev_seconds",
         ],
     )
@@ -588,6 +746,12 @@ def write_query_runs_csv(path: Path, results: list[QueryMetrics]) -> None:
                     "run": index,
                     "seconds": seconds,
                     "rows": result.rows,
+                    "candidate_row_groups": result.candidate_row_groups,
+                    "total_row_groups": result.total_row_groups,
+                    "candidate_row_group_fraction": result.candidate_row_group_fraction,
+                    "candidate_rows": result.candidate_rows,
+                    "total_rows": result.total_rows,
+                    "candidate_row_fraction": result.candidate_row_fraction,
                     "xmin": result.bbox[0],
                     "ymin": result.bbox[1],
                     "xmax": result.bbox[2],
@@ -604,6 +768,12 @@ def write_query_runs_csv(path: Path, results: list[QueryMetrics]) -> None:
             "run",
             "seconds",
             "rows",
+            "candidate_row_groups",
+            "total_row_groups",
+            "candidate_row_group_fraction",
+            "candidate_rows",
+            "total_rows",
+            "candidate_row_fraction",
             "xmin",
             "ymin",
             "xmax",
@@ -640,14 +810,16 @@ def print_locality_results(results: list[LocalityMetrics]) -> None:
 def print_query_results(results: list[QueryMetrics]) -> None:
     print(
         "algorithm,source,query,rows,repeats,warmups,best_seconds,mean_seconds,"
-        "median_seconds,p95_seconds,stdev_seconds,bbox"
+        "median_seconds,stdev_seconds,candidate_row_groups,"
+        "total_row_groups,candidate_row_group_fraction,bbox"
     )
     for result in results:
         print(
             f"{result.algorithm},{result.source},{result.query},{result.rows},{result.repeats},"
             f"{result.warmups},{result.best_seconds:.6f},{result.mean_seconds:.6f},"
-            f"{result.median_seconds:.6f},{result.p95_seconds:.6f},"
-            f"{result.stdev_seconds:.6f},"
+            f"{result.median_seconds:.6f},{result.stdev_seconds:.6f},"
+            f"{result.candidate_row_groups},"
+            f"{result.total_row_groups},{result.candidate_row_group_fraction:.6f},"
             f"{result.bbox}"
         )
 
@@ -740,6 +912,11 @@ def main() -> None:
         )
         has_remote_output = any(is_remote_ref(ref) for ref in outputs.values())
         if has_remote_output:
+            if args.query_warmups != 0:
+                raise SystemExit(
+                    "remote benchmarks do not allow warmups; pass --query-warmups 0"
+                )
+            disable_duckdb_caches(con)
             load_extension(con, "httpfs")
 
         missing = [
@@ -766,6 +943,9 @@ def main() -> None:
             args.query_repeats,
             args.query_warmups,
             args.query_seed,
+            has_remote_output,
+            args.threads,
+            args.memory_limit,
         )
         print_query_results(query_results)
         write_query_csv(args.metrics_dir / "queries.csv", query_results)

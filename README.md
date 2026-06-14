@@ -12,7 +12,8 @@ This repository contains a comparison of spatial sort algorithms for well packed
 
 ## Conditions
 
-- Row group size: 10,000 rows
+- Row group size: 50,000 rows (`COPY ... ROW_GROUP_SIZE 50000`; DuckDB writes
+  approximately 50k rows per group)
 - Compression: ZSTD
 - Output file format: GeoParquet v1.1
 
@@ -36,19 +37,17 @@ The algorithms are compared based on the following criteria:
 
 ## Results
 
-Full `pois.cogp.parquet` results, run on 2026-06-11 with 30,052,264 rows,
-row group size 10,000, 2,935 row groups, 8 DuckDB threads, 3 query warmups,
-and 30 measured query repeats.
-Query timings in this section use local filesystem reads from `outputs/*.parquet`.
-The merged CSV files are in `metrics/full/`.
+Full `pois.cogp.parquet` build and locality results, run on 2026-06-14 with
+30,052,264 rows, row group size 50,000, 587 row groups, and 8 DuckDB threads.
+The build and locality CSV files are in `metrics/rg50000/`.
 
 ### Build and size
 
 | Algorithm | Sort time (s) | File size (GiB) | Rows | Row groups |
 | --- | ---: | ---: | ---: | ---: |
-| Hilbert | 21.1 | 1.888 | 30,052,264 | 2,935 |
-| Morton (`ST_QuadKey`) | 24.3 | 1.899 | 30,052,264 | 2,935 |
-| STR pack | 47.7 | 1.882 | 30,052,264 | 2,935 |
+| Hilbert | 18.5 | 1.826 | 30,052,264 | 587 |
+| Morton (`ST_QuadKey`) | 18.0 | 1.837 | 30,052,264 | 587 |
+| STR pack | 40.9 | 1.829 | 30,052,264 | 587 |
 
 ### Spatial locality
 
@@ -57,11 +56,14 @@ Lower values are better. `sum_area` is the sum of row group bbox areas, and
 
 | Algorithm | Sum area | Median area | Pairwise overlap area | Overlap area ratio |
 | --- | ---: | ---: | ---: | ---: |
-| Hilbert | 72,146.0 | 0.494 | 17,197.1 | 0.238 |
-| Morton (`ST_QuadKey`) | 155,863.2 | 0.835 | 171,428.5 | 1.100 |
-| STR pack | 52,294.3 | 0.451 | 2,813.0 | 0.054 |
+| Hilbert | 76,868.4 | 5.217 | 21,870.7 | 0.285 |
+| Morton (`ST_QuadKey`) | 167,793.5 | 8.223 | 202,075.2 | 1.204 |
+| STR pack | 59,780.9 | 4.140 | 5,397.5 | 0.090 |
 
 Row group bbox overlap:
+
+The numeric metrics above are from the 50k row group run. The figures below are
+qualitative visualizations from `imgs/`.
 
 | Hilbert | Morton (`ST_QuadKey`) | STR pack |
 | --- | --- | --- |
@@ -73,43 +75,50 @@ Additional views:
 | --- | --- |
 | ![Hilbert row group bbox overlap additional view](imgs/hilbert2.png) | ![STR pack row group bbox overlap additional view](imgs/str2.png) |
 
-### Query performance
+### Remote query performance
 
-Median bbox query time in milliseconds. Each query used 3 warmups and 30
-measured repeats. The benchmark interleaves algorithms per query with shuffled
-order to reduce fixed-order cache bias. Raw timings are in
-`metrics/full/query_runs.csv`.
+Query benchmarks target remote Parquet files. Remote benchmarks disable
+DuckDB external file, HTTP metadata, Parquet metadata, and caching-operator
+caches, and use a fresh DuckDB connection for each measured query. Connection
+creation and extension loading are outside the timed section. Warmups are
+disabled for remote runs.
 
-| Algorithm | Tokyo | SF Bay | New York | London | World 1deg |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Hilbert | 44.18 | 38.71 | 39.98 | 40.83 | 33.19 |
-| Morton (`ST_QuadKey`) | 44.52 | 39.33 | 39.98 | 41.39 | 38.19 |
-| STR pack | 44.30 | 37.98 | 40.58 | 41.85 | 37.38 |
+Query bboxes:
 
-P95 bbox query time in milliseconds:
+| Query | xmin | ymin | xmax | ymax |
+| --- | ---: | ---: | ---: | ---: |
+| Tokyo | 139.55 | 35.50 | 139.95 | 35.85 |
+| SF Bay | -122.65 | 37.55 | -121.75 | 38.05 |
+| New York | -74.30 | 40.45 | -73.65 | 40.95 |
+| London | -0.55 | 51.25 | 0.35 | 51.75 |
+| Paris | 2.20 | 48.75 | 2.45 | 48.95 |
+| Singapore | 103.60 | 1.20 | 104.05 | 1.50 |
 
-| Algorithm | Tokyo | SF Bay | New York | London | World 1deg |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Hilbert | 46.00 | 40.37 | 41.60 | 42.61 | 34.57 |
-| Morton (`ST_QuadKey`) | 46.70 | 40.51 | 41.22 | 43.34 | 43.16 |
-| STR pack | 46.67 | 39.05 | 42.11 | 43.65 | 40.83 |
+Latest remote benchmark, run on 2026-06-14 with 30 measured repeats and no
+warmups. Median bbox query time in milliseconds:
 
-To benchmark Parquet files hosted on a remote server, upload the sorted files
-with the same names (`pois.hilbert.parquet`, `pois.morton.parquet`,
-`pois.str.parquet`) and pass the base URL:
+| Algorithm | Tokyo | SF Bay | New York | London | Paris | Singapore |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Hilbert | 1,524.94 | 1,149.50 | 1,077.67 | 1,254.57 | 1,180.98 | 1,038.48 |
+| Morton (`ST_QuadKey`) | 1,531.49 | 1,186.80 | 1,211.90 | 1,438.93 | 1,540.82 | 1,073.98 |
+| STR pack | 1,047.72 | 967.51 | 978.86 | 1,149.98 | 1,102.09 | 1,006.91 |
+
+Candidate row groups by bbox column statistics. Total row groups: 587.
+
+| Algorithm | Tokyo | SF Bay | New York | London | Paris | Singapore |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Hilbert | 11 | 5 | 6 | 8 | 7 | 3 |
+| Morton (`ST_QuadKey`) | 11 | 6 | 8 | 10 | 12 | 4 |
+| STR pack | 6 | 3 | 4 | 7 | 6 | 3 |
 
 ```bash
 uv run python scripts/compare_spatial_sort.py bench \
-  --bench-output-base https://example.com/path/to/parquets \
+  --bench-output-base https://cogp-demo.spatialty.io/bench \
   --skip-locality \
   --query-repeats 30 \
-  --query-warmups 3 \
+  --query-warmups 0 \
   --query-seed 42 \
   --threads 8 \
   --memory-limit 16GB \
   --metrics-dir metrics/remote
 ```
-
-Remote query metrics include `source=remote` in `queries.csv` and
-`query_runs.csv`. Use `--skip-locality` for remote runs unless you explicitly
-want to rescan the files to recompute row group bbox metrics.
