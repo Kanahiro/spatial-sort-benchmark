@@ -58,7 +58,7 @@ Lower values are better. `sum_area` is the sum of row group bbox areas, and
 | --- | ---: | ---: | ---: | ---: |
 | Hilbert | 76,868.4 | 5.217 | 21,870.7 | 0.285 |
 | Morton (`ST_QuadKey`) | 167,793.5 | 8.223 | 202,075.2 | 1.204 |
-| STR pack | 59,780.9 | 4.140 | 5,397.5 | 0.090 |
+| **STR pack** | **59,780.9** | **4.140** | **5,397.5** | **0.090** |
 
 Row group bbox overlap:
 
@@ -101,7 +101,7 @@ warmups. Median bbox query time in milliseconds:
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Hilbert | 1,524.94 | 1,149.50 | 1,077.67 | 1,254.57 | 1,180.98 | 1,038.48 |
 | Morton (`ST_QuadKey`) | 1,531.49 | 1,186.80 | 1,211.90 | 1,438.93 | 1,540.82 | 1,073.98 |
-| STR pack | 1,047.72 | 967.51 | 978.86 | 1,149.98 | 1,102.09 | 1,006.91 |
+| **STR pack** | **1,047.72** | **967.51** | **978.86** | **1,149.98** | **1,102.09** | **1,006.91** |
 
 Candidate row groups by bbox column statistics. Total row groups: 587.
 
@@ -109,7 +109,7 @@ Candidate row groups by bbox column statistics. Total row groups: 587.
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Hilbert | 11 | 5 | 6 | 8 | 7 | 3 |
 | Morton (`ST_QuadKey`) | 11 | 6 | 8 | 10 | 12 | 4 |
-| STR pack | 6 | 3 | 4 | 7 | 6 | 3 |
+| **STR pack** | **6** | **3** | **4** | **7** | **6** | **3** |
 
 ```bash
 uv run python scripts/compare_spatial_sort.py bench \
