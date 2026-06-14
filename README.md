@@ -37,7 +37,7 @@ The algorithms are compared based on the following criteria:
 
 ## Results
 
-Full `pois.cogp.parquet` build and locality results, run on 2026-06-14 with
+Full `pois.*.parquet` build and locality results, run on 2026-06-14 with
 30,052,264 rows, row group size 50,000, 587 row groups, and 8 DuckDB threads.
 The build and locality CSV files are in `metrics/rg50000/`.
 
@@ -60,10 +60,7 @@ Lower values are better. `sum_area` is the sum of row group bbox areas, and
 | Morton (`ST_QuadKey`) | 167,793.5 | 8.223 | 202,075.2 | 1.204 |
 | **STR pack** | **59,780.9** | **4.140** | **5,397.5** | **0.090** |
 
-Row group bbox overlap:
-
-The numeric metrics above are from the 50k row group run. The figures below are
-qualitative visualizations from `imgs/`.
+#### Row group bbox overlap:
 
 | Hilbert | Morton (`ST_QuadKey`) | STR pack |
 | --- | --- | --- |
