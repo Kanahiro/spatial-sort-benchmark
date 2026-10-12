@@ -5,6 +5,7 @@ This repository contains a comparison of spatial sort algorithms for well packed
 - Hilbert curve
 - Morton curve
 - Sort-Tile-Recursive
+- Boost.Geometry-style R-tree Packing
 
 ## Data
 
@@ -12,8 +13,8 @@ This repository contains a comparison of spatial sort algorithms for well packed
 
 ## Conditions
 
-- Row group size: 50,000 rows (`COPY ... ROW_GROUP_SIZE 50000`; DuckDB writes
-  approximately 50k rows per group)
+- Row group size: 50,000 requested (`COPY ... ROW_GROUP_SIZE 50000`);
+  DuckDB 1.5.5 writes 51,200 rows per full group
 - Compression: ZSTD
 - Output file format: GeoParquet v1.1
 
@@ -32,22 +33,56 @@ The algorithms are compared based on the following criteria:
   lexicographic quadkey ordering is Z-order/Morton ordering over the Web
   Mercator tile grid.
 - STR pack sorts by bbox center-x, splits rows into approximately square
-  strips based on the target row group size, then sorts each strip by center-y
-  with alternating direction.
+  strips containing whole Parquet row groups, then sorts each strip by center-y
+  with alternating direction. The strip width uses DuckDB's measured row group
+  width, so a written row group cannot straddle two strips.
+- Boost-style pack follows the node-capacity and recursive median-split rules in
+  [Boost.Geometry's packing implementation](https://github.com/boostorg/geometry/blob/develop/include/boost/geometry/index/detail/rtree/pack_create.hpp):
+  choose the longer side of the current hint box, split bbox centers at the
+  capacity-aware median, and recurse until each leaf fits the target size.
+  DuckDB window queries perform the splits; the benchmark does not require
+  Boost or a C++ compiler. Equal center coordinates use source row number as a
+  deterministic tie-breaker, so tied rows need not match Boost's exact order.
+  A small Parquet write measures DuckDB's actual row group width and uses that
+  width as the packing node capacity, keeping leaf boundaries aligned.
+
+To build and benchmark all four algorithms on a local input file:
+
+```bash
+uv run python scripts/compare_spatial_sort.py all \
+  --input pois.cogp.parquet \
+  --metrics-dir metrics/rg50000-fair-20261013 \
+  --row-group-size 50000 \
+  --threads 8 \
+  --memory-limit 16GB \
+  --force
+```
+
+Use `--algorithms boost_pack` to run only Boost-style packing. Its build time
+includes the iterative DuckDB partitioning and final Parquet write.
 
 ## Results
 
-Full `pois.*.parquet` build and locality results, run on 2026-06-14 with
-30,052,264 rows, row group size 50,000, 587 row groups, and 8 DuckDB threads.
-The build and locality CSV files are in `metrics/rg50000/`.
+Full local benchmark run on 2026-10-13 using DuckDB 1.5.5, 30,052,264 POIs,
+`ROW_GROUP_SIZE 50000`, ZSTD, 8 threads, and a 16GB DuckDB memory limit. Every
+output has 587 row groups. The generated CSV files are in
+`metrics/rg50000-fair-20261013/` (ignored by Git).
+
+An earlier STR run reported an overlap ratio of 0.090 because its x-strip
+boundaries fell inside written row groups. DuckDB writes 51,200 rows per full
+group for the requested 50,000, and the earlier STR strip width was not a
+multiple of either size. The current STR implementation uses whole written
+row groups per strip. Both STR and Boost-style packing now use the measured
+51,200-row leaf width.
 
 ### Build and size
 
-| Algorithm | Sort time (s) | File size (GiB) | Rows | Row groups |
+| Algorithm | Build time (s) | File size (GiB) | Rows | Row groups |
 | --- | ---: | ---: | ---: | ---: |
-| Hilbert | 18.5 | 1.826 | 30,052,264 | 587 |
-| Morton (`ST_QuadKey`) | 18.0 | 1.837 | 30,052,264 | 587 |
-| STR pack | 40.9 | 1.829 | 30,052,264 | 587 |
+| Hilbert | 8.5 | 1.826 | 30,052,264 | 587 |
+| Morton (`ST_QuadKey`) | 9.6 | 1.837 | 30,052,264 | 587 |
+| STR pack | 16.4 | 1.830 | 30,052,264 | 587 |
+| Boost-style pack | 28.9 | 1.839 | 30,052,264 | 587 |
 
 ### Spatial locality
 
@@ -58,9 +93,39 @@ Lower values are better. `sum_area` is the sum of row group bbox areas, and
 | --- | ---: | ---: | ---: | ---: |
 | Hilbert | 76,868.4 | 5.217 | 21,870.7 | 0.285 |
 | Morton (`ST_QuadKey`) | 167,793.5 | 8.223 | 202,075.2 | 1.204 |
-| **STR pack** | **59,780.9** | **4.140** | **5,397.5** | **0.090** |
+| STR pack | **51,200.6** | **4.424** | **0.0** | **0.000** |
+| Boost-style pack | 52,701.5 | 5.204 | **0.0** | **0.000** |
 
-#### Row group bbox overlap:
+### Local query performance
+
+The six bbox queries below were interleaved across algorithms with 3 warmups
+and 30 measured repeats. Median elapsed time in milliseconds:
+
+| Algorithm | Tokyo | SF Bay | New York | London | Paris | Singapore |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Hilbert | 9.15 | 6.09 | 6.60 | 7.20 | 7.44 | 8.18 |
+| Morton (`ST_QuadKey`) | 9.30 | 6.11 | 7.02 | 7.70 | 8.95 | 8.09 |
+| STR pack | 8.13 | 6.02 | 6.53 | 6.85 | 7.04 | 8.04 |
+| Boost-style pack | 8.12 | 6.09 | 6.61 | 6.96 | 7.24 | 7.87 |
+
+Candidate row groups by bbox column statistics:
+
+| Algorithm | Tokyo | SF Bay | New York | London | Paris | Singapore |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Hilbert | 11 | 5 | 6 | 8 | 7 | 3 |
+| Morton (`ST_QuadKey`) | 11 | 6 | 8 | 10 | 12 | 4 |
+| STR pack | 7 | 3 | 4 | 5 | 6 | 2 |
+| Boost-style pack | 6 | 3 | 5 | 5 | 7 | 2 |
+
+Both STR and Boost-style packing have zero pairwise row group bbox overlap on
+this point dataset. STR has the smaller total bbox area and shorter build time
+in this run. Their local query medians are close. These local times should not
+be compared directly with the remote results below.
+
+#### Historical row group bbox images
+
+These images show the earlier STR output whose strips were not aligned to
+Parquet row groups. They do not illustrate the corrected results above.
 
 | Hilbert | Morton (`ST_QuadKey`) | STR pack |
 | --- | --- | --- |
@@ -91,14 +156,19 @@ Query bboxes:
 | Paris | 2.20 | 48.75 | 2.45 | 48.95 |
 | Singapore | 103.60 | 1.20 | 104.05 | 1.50 |
 
-Latest remote benchmark, run on 2026-06-14 with 30 measured repeats and no
-warmups. Median bbox query time in milliseconds:
+Remote benchmark run on 2026-10-13 with 30 measured repeats, no warmups, and
+interleaved algorithms. The STR and Boost files were uploaded to
+`cogp/bench/` after the row group alignment fix; the existing Hilbert and
+Morton files were retained. The generated CSV files are in
+`metrics/remote-fair-20261013/` (ignored by Git). Median bbox query time in
+milliseconds:
 
 | Algorithm | Tokyo | SF Bay | New York | London | Paris | Singapore |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Hilbert | 1,524.94 | 1,149.50 | 1,077.67 | 1,254.57 | 1,180.98 | 1,038.48 |
-| Morton (`ST_QuadKey`) | 1,531.49 | 1,186.80 | 1,211.90 | 1,438.93 | 1,540.82 | 1,073.98 |
-| **STR pack** | **1,047.72** | **967.51** | **978.86** | **1,149.98** | **1,102.09** | **1,006.91** |
+| Hilbert | 1,379.04 | 1,005.10 | 1,080.83 | 1,164.90 | 1,100.93 | 966.37 |
+| Morton (`ST_QuadKey`) | 1,382.73 | 1,082.80 | 1,135.17 | 1,359.26 | 1,436.61 | 983.42 |
+| STR pack | 1,050.94 | 939.48 | 944.95 | 975.44 | 1,035.58 | 929.97 |
+| Boost-style pack | 1,053.83 | 936.70 | 995.14 | 974.83 | 1,096.29 | 939.71 |
 
 Candidate row groups by bbox column statistics. Total row groups: 587.
 
@@ -106,16 +176,21 @@ Candidate row groups by bbox column statistics. Total row groups: 587.
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Hilbert | 11 | 5 | 6 | 8 | 7 | 3 |
 | Morton (`ST_QuadKey`) | 11 | 6 | 8 | 10 | 12 | 4 |
-| **STR pack** | **6** | **3** | **4** | **7** | **6** | **3** |
+| STR pack | 7 | 3 | 4 | 5 | 6 | 2 |
+| Boost-style pack | 6 | 3 | 5 | 5 | 7 | 2 |
+
+STR and Boost-style packing are close on these remote queries. This run does
+not establish a consistent latency advantage for either packing algorithm.
 
 ```bash
 uv run python scripts/compare_spatial_sort.py bench \
   --bench-output-base https://cogp-demo.spatialty.io/bench \
+  --algorithms hilbert,morton,str,boost_pack \
   --skip-locality \
   --query-repeats 30 \
   --query-warmups 0 \
   --query-seed 42 \
   --threads 8 \
   --memory-limit 16GB \
-  --metrics-dir metrics/remote
+  --metrics-dir metrics/remote-fair-20261013
 ```

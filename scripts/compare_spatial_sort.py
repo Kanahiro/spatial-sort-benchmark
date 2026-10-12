@@ -6,6 +6,7 @@ import csv
 import math
 import random
 import statistics
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,7 +15,7 @@ from typing import Iterable
 import duckdb
 
 
-ALGORITHMS = ("hilbert", "morton", "str")
+ALGORITHMS = ("hilbert", "morton", "str", "boost_pack")
 WORLD_XMIN = -180.0
 WORLD_YMIN = -90.0
 WORLD_XMAX = 180.0
@@ -127,7 +128,33 @@ def source_scan(input_path: Path, limit: int | None) -> str:
     scan = f"read_parquet({sql_literal_path(input_path)})"
     if limit is None:
         return f"SELECT * FROM {scan}"
-    return f"SELECT * FROM {scan} LIMIT {int(limit)}"
+    scan = f"read_parquet({sql_literal_path(input_path)}, file_row_number = true)"
+    return f"SELECT id, tags, geometry, bbox FROM {scan} WHERE file_row_number < {int(limit)}"
+
+
+def actual_row_group_size(con: duckdb.DuckDBPyConnection, requested: int) -> int:
+    # DuckDB rounds ROW_GROUP_SIZE to a writer granularity. Packing leaves must
+    # match the written row groups, or a group straddles two unrelated leaves.
+    with tempfile.TemporaryDirectory(prefix="row_group_probe_") as temp_dir:
+        probe = Path(temp_dir) / "probe.parquet"
+        con.execute(
+            f"""
+            COPY (SELECT i FROM range({2 * requested}) AS t(i))
+            TO {sql_literal_path(probe)}
+            (FORMAT PARQUET, ROW_GROUP_SIZE {requested})
+            """
+        )
+        return int(
+            con.execute(
+                f"""
+                SELECT row_group_num_rows
+                FROM parquet_metadata({sql_literal_path(probe)})
+                WHERE path_in_schema = 'i'
+                ORDER BY row_group_id
+                LIMIT 1
+                """
+            ).fetchone()[0]
+        )
 
 
 def sorted_select_sql(
@@ -177,7 +204,9 @@ def sorted_select_sql(
         rows = con.execute(f"SELECT count(*) FROM ({base})").fetchone()[0]
         tile_count = max(1, math.ceil(rows / row_group_size))
         strip_count = max(1, math.ceil(math.sqrt(tile_count)))
-        strip_size = math.ceil(rows / strip_count)
+        # A strip must contain whole Parquet leaves; otherwise one row group
+        # spans two strips and its bbox can overlap unrelated leaves.
+        strip_size = math.ceil(tile_count / strip_count) * row_group_size
         return f"""
             WITH src AS (
                 SELECT
@@ -203,6 +232,147 @@ def sorted_select_sql(
     raise ValueError(f"unknown algorithm: {algorithm}")
 
 
+def boost_pack_select_sql(
+    con: duckdb.DuckDBPyConnection,
+    input_path: Path,
+    node_capacity: int,
+    limit: int | None,
+) -> str:
+    """Materialize Boost-style leaf order in DuckDB and return its final scan."""
+    source = f"read_parquet({sql_literal_path(input_path)}, file_row_number = true)"
+    limit_filter = f"WHERE file_row_number < {int(limit)}" if limit is not None else ""
+    rows, xmin, ymin, xmax, ymax, invalid = con.execute(
+        f"""
+        SELECT count(*), min(bbox.xmin), min(bbox.ymin),
+               max(bbox.xmax), max(bbox.ymax),
+               count(*) FILTER (WHERE
+                   NOT (isfinite(bbox.xmin) AND isfinite(bbox.ymin)
+                        AND isfinite(bbox.xmax) AND isfinite(bbox.ymax)
+                        AND bbox.xmin <= bbox.xmax
+                        AND bbox.ymin <= bbox.ymax)
+                   OR bbox.xmin IS NULL OR bbox.ymin IS NULL
+                   OR bbox.xmax IS NULL OR bbox.ymax IS NULL)
+        FROM {source} {limit_filter}
+        """
+    ).fetchone()
+    if not rows:
+        raise ValueError("Boost packing requires at least one input row")
+    if invalid:
+        raise ValueError(f"Boost packing requires valid finite bboxes ({invalid} invalid)")
+    if node_capacity < 2:
+        raise ValueError("Boost packing requires node_capacity >= 2")
+
+    # Boost's initial subtree capacity is the largest power of Max below N.
+    subtree_max = 1
+    power = node_capacity
+    while power < rows:
+        subtree_max = power
+        power *= node_capacity
+    subtree_min = max(1, node_capacity * 3 // 10) * (subtree_max // node_capacity)
+
+    con.execute("DROP TABLE IF EXISTS __boost_pack_rows")
+    con.execute(
+        f"""
+        CREATE TEMP TABLE __boost_pack_rows AS
+        SELECT file_row_number,
+               (bbox.xmin + bbox.xmax) / 2 AS cx,
+               (bbox.ymin + bbox.ymax) / 2 AS cy,
+               0::BIGINT AS start_rank,
+               file_row_number::BIGINT AS local_rank,
+               {xmin}::DOUBLE AS hint_xmin,
+               {ymin}::DOUBLE AS hint_ymin,
+               {xmax}::DOUBLE AS hint_xmax,
+               {ymax}::DOUBLE AS hint_ymax,
+               {subtree_max}::BIGINT AS maxc,
+               {subtree_min}::BIGINT AS minc
+        FROM {source} {limit_filter}
+        """
+    )
+
+    # Each pass handles all current nodes. SQL window ranks implement the
+    # median split; the node bounds remain the geometric half-box used by Boost.
+    while con.execute("SELECT max(maxc) FROM __boost_pack_rows").fetchone()[0] > 1:
+        con.execute("DROP TABLE IF EXISTS __boost_pack_next")
+        con.execute(
+            f"""
+            CREATE TEMP TABLE __boost_pack_next AS
+            WITH groups AS (
+                SELECT start_rank, count(*) AS n,
+                       min(hint_xmin) AS xmin, min(hint_ymin) AS ymin,
+                       min(hint_xmax) AS xmax, min(hint_ymax) AS ymax,
+                       min(maxc) AS maxc, min(minc) AS minc
+                FROM __boost_pack_rows
+                GROUP BY start_rank
+            ),
+            counts AS (
+                SELECT *, n // maxc AS q, n % maxc AS rem,
+                       (n - minc) // maxc AS q2,
+                       (n - minc) % maxc AS rem2
+                FROM groups
+            ),
+            plans AS (
+                SELECT *,
+                    CASE
+                        WHEN rem = 0 THEN (q // 2) * maxc
+                        WHEN rem >= minc THEN ((q + 1) // 2) * maxc
+                        WHEN rem2 = 0 THEN ((q2 + 1) // 2) * maxc
+                        WHEN q2 = 0 THEN rem2
+                        ELSE ((q2 + 2) // 2) * maxc
+                    END AS median_count,
+                    (xmax - xmin >= ymax - ymin) AS split_x,
+                    (xmin + (xmax - xmin) / 2) AS xmid,
+                    (ymin + (ymax - ymin) / 2) AS ymid
+                FROM counts
+            ),
+            ranked AS (
+                SELECT r.file_row_number, r.cx, r.cy, p.*,
+                       row_number() OVER (
+                           PARTITION BY r.start_rank
+                           ORDER BY CASE WHEN p.split_x THEN r.cx ELSE r.cy END,
+                                    r.file_row_number
+                       ) AS rn
+                FROM __boost_pack_rows AS r
+                JOIN plans AS p USING (start_rank)
+                WHERE p.maxc > 1 AND p.n > p.maxc
+            )
+            SELECT file_row_number, cx, cy,
+                   CASE WHEN rn <= median_count THEN start_rank
+                        ELSE start_rank + median_count END AS start_rank,
+                   CASE WHEN rn <= median_count THEN rn - 1
+                        ELSE rn - median_count - 1 END AS local_rank,
+                   CASE WHEN split_x AND rn > median_count THEN xmid
+                        ELSE xmin END AS hint_xmin,
+                   CASE WHEN NOT split_x AND rn > median_count THEN ymid
+                        ELSE ymin END AS hint_ymin,
+                   CASE WHEN split_x AND rn <= median_count THEN xmid
+                        ELSE xmax END AS hint_xmax,
+                   CASE WHEN NOT split_x AND rn <= median_count THEN ymid
+                        ELSE ymax END AS hint_ymax,
+                   maxc, minc
+            FROM ranked
+            UNION ALL
+            SELECT r.file_row_number, r.cx, r.cy, r.start_rank, r.local_rank,
+                   r.hint_xmin, r.hint_ymin, r.hint_xmax, r.hint_ymax,
+                   CASE WHEN p.maxc > 1 THEN p.maxc // {node_capacity}
+                        ELSE p.maxc END AS maxc,
+                   CASE WHEN p.maxc > 1 THEN p.minc // {node_capacity}
+                        ELSE p.minc END AS minc
+            FROM __boost_pack_rows AS r
+            JOIN plans AS p USING (start_rank)
+            WHERE p.maxc <= 1 OR p.n <= p.maxc
+            """
+        )
+        con.execute("DROP TABLE __boost_pack_rows")
+        con.execute("ALTER TABLE __boost_pack_next RENAME TO __boost_pack_rows")
+
+    return f"""
+        SELECT p.id, p.tags, p.geometry, p.bbox
+        FROM {source} AS p
+        JOIN __boost_pack_rows AS packed USING (file_row_number)
+        ORDER BY packed.start_rank, packed.local_rank
+    """
+
+
 def build_one(
     con: duckdb.DuckDBPyConnection,
     algorithm: str,
@@ -221,14 +391,29 @@ def build_one(
         output_path.parent.mkdir(parents=True, exist_ok=True)
         if output_path.exists():
             output_path.unlink()
-        query = sorted_select_sql(algorithm, input_path, limit, row_group_size, con)
-        copy_sql = f"""
-            COPY ({query})
-            TO {sql_literal_path(output_path)}
-            (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE {int(row_group_size)})
-        """
         start = time.perf_counter()
-        con.execute(copy_sql)
+        if algorithm == "boost_pack":
+            node_capacity = actual_row_group_size(con, row_group_size)
+            query = boost_pack_select_sql(con, input_path, node_capacity, limit)
+            con.execute(
+                f"""
+                COPY ({query}) TO {sql_literal_path(output_path)}
+                (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE {int(row_group_size)})
+                """
+            )
+        else:
+            leaf_size = (
+                actual_row_group_size(con, row_group_size)
+                if algorithm == "str"
+                else row_group_size
+            )
+            query = sorted_select_sql(algorithm, input_path, limit, leaf_size, con)
+            copy_sql = f"""
+                COPY ({query})
+                TO {sql_literal_path(output_path)}
+                (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE {int(row_group_size)})
+            """
+            con.execute(copy_sql)
         elapsed = time.perf_counter() - start
         skipped = False
 
@@ -857,7 +1042,7 @@ def existing_outputs(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Compare Hilbert, Morton, and STR packed GeoParquet sorting."
+        description="Compare Hilbert, Morton, STR, and Boost packed GeoParquet sorting."
     )
     parser.add_argument("command", choices=("build", "bench", "all"))
     parser.add_argument("--input", type=Path, default=Path("pois.cogp.parquet"))
@@ -887,7 +1072,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    con = connect(args.threads, args.memory_limit)
+    needs_spatial = args.command in ("build", "all") and any(
+        algorithm in ("hilbert", "morton") for algorithm in args.algorithms
+    )
+    con = connect(args.threads, args.memory_limit, load_spatial=needs_spatial)
     build_results: list[BuildResult] = []
 
     if args.command in ("build", "all"):
